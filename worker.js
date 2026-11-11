@@ -46,6 +46,9 @@ export class Room {
 	constructor(ctx, env) {
 		this.ctx = ctx;
 		this.env = env;
+		// Último MOVE de cada jogador (id -> { move, state }). Fica só na memória: o attachment do
+		// WebSocket tem limite de 2 KB e um MOVE grande (reboque, áudio) derrubava a conexão.
+		this.moves = new Map();
 	}
 
 	async fetch(request) {
@@ -56,7 +59,7 @@ export class Room {
 		const client = pair[0];
 		const server = pair[1];
 		this.ctx.acceptWebSocket(server);
-		server.serializeAttachment({ roomId: roomId, id: "", nickname: "", owner: false, joined: false, lastMove: null, lastState: "", signalIp: request.headers.get("CF-Connecting-IP") || "", endpointIp: "", endpointPort: 0, p2pReady: false });
+		server.serializeAttachment({ roomId: roomId, id: "", nickname: "", owner: false, joined: false, signalIp: request.headers.get("CF-Connecting-IP") || "", endpointIp: "", endpointPort: 0, p2pReady: false });
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
@@ -88,9 +91,8 @@ export class Room {
 			if (room && room.directMode) return;
 			const move = message.slice(1);
 			if (move.some(function (value) { return value.length > 4096; })) return;
-			peer.lastMove = move;
-			if (move.length > 9 && move[9]) peer.lastState = move[9];
-			ws.serializeAttachment(peer);
+			const previousMove = this.moves.get(peer.id);
+			this.moves.set(peer.id, { move: move, state: (move.length > 9 && move[9]) ? move[9] : (previousMove ? previousMove.state : "") });
 			const truck = [peer.id, peer.nickname].concat(move, [peer.owner ? "1" : "0"]);
 			return this.broadcast(encodeWire("TRUCK", truck), ws);
 		}
@@ -113,7 +115,7 @@ export class Room {
 		if (message[0] === "ENDPOINT" && message.length >= 3) {
 			const port = parseInt(message[2], 10);
 			const address = message[1];
-			if (!isValidIPv4(address) || address !== peer.signalIp || !Number.isFinite(port) || port < 1 || port > 65535) return;
+			if (!endpointAllowed(address, peer.signalIp) || !Number.isFinite(port) || port < 1 || port > 65535) return;
 			peer.endpointIp = address;
 			peer.endpointPort = port;
 			peer.p2pReady = false;
@@ -131,7 +133,7 @@ export class Room {
 				await this.ctx.storage.put("room", room);
 				this.broadcastJoined(encodeWire("DIRECT_MODE", ["0"]), null);
 			}
-			const endpoint = encodeWire("ENDPOINT", [peer.id, peer.nickname, address, port, peer.token]);
+			const endpoint = encodeWire("ENDPOINT", [peer.id, peer.nickname, address, port, peer.token, peer.lanIp || "", peer.lanPort || ""]);
 			this.broadcastJoined(endpoint, ws);
 			this.sendPeerEndpoints(ws);
 			return;
@@ -175,12 +177,22 @@ export class Room {
 		peer.p2pReady = false;
 		const candidateIp = create ? message[6] : message[3];
 		const candidatePort = parseInt(create ? message[7] : message[4], 10);
-		if (isValidIPv4(candidateIp) && candidateIp === peer.signalIp && Number.isFinite(candidatePort) && candidatePort > 0 && candidatePort <= 65535) {
+		if (endpointAllowed(candidateIp, peer.signalIp) && Number.isFinite(candidatePort) && candidatePort > 0 && candidatePort <= 65535) {
 			peer.endpointIp = candidateIp;
 			peer.endpointPort = candidatePort;
 		} else {
 			peer.endpointIp = "";
 			peer.endpointPort = 0;
+		}
+		// Candidato da rede local (IP privado + porta do mesmo socket UDP): permite P2P direto entre aparelhos no mesmo Wi-Fi.
+		const lanIp = create ? message[8] : message[5];
+		const lanPort = parseInt(create ? message[9] : message[6], 10);
+		if (isPrivateIPv4(lanIp) && Number.isFinite(lanPort) && lanPort > 0 && lanPort <= 65535) {
+			peer.lanIp = lanIp;
+			peer.lanPort = lanPort;
+		} else {
+			peer.lanIp = "";
+			peer.lanPort = 0;
 		}
 		if (peer.owner) meta.ownerId = peer.id;
 		meta.directMode = false;
@@ -202,7 +214,7 @@ export class Room {
 		this.sendPeerEndpoints(ws);
 		if (!create) this.broadcastJoined(encodeWire("DIRECT_MODE", ["0"]), ws);
 		if (!create) this.broadcast(encodeWire("PLAYER_JOINED", [peer.id, peer.nickname]), ws);
-		if (peer.endpointIp && peer.endpointPort > 0) this.broadcastJoined(encodeWire("ENDPOINT", [peer.id, peer.nickname, peer.endpointIp, peer.endpointPort, peer.token]), ws);
+		if (peer.endpointIp && peer.endpointPort > 0) this.broadcastJoined(encodeWire("ENDPOINT", [peer.id, peer.nickname, peer.endpointIp, peer.endpointPort, peer.token, peer.lanIp || "", peer.lanPort || ""]), ws);
 	}
 
 	async webSocketClose(ws) {
@@ -217,6 +229,7 @@ export class Room {
 		const peer = ws.deserializeAttachment() || {};
 		if (!peer.joined) return;
 		const wasOwner = !!peer.owner;
+		this.moves.delete(peer.id);
 		peer.joined = false;
 		peer.owner = false;
 		try { ws.serializeAttachment(peer); } catch (_) { }
@@ -313,9 +326,10 @@ export class Room {
 		for (const ws of this.ctx.getWebSockets()) {
 			if (ws === target) continue;
 			const peer = ws.deserializeAttachment() || {};
-			if (!peer.joined || !peer.lastMove) continue;
-			const truck = [peer.id, peer.nickname].concat(peer.lastMove, [peer.owner ? "1" : "0"]);
-			if (truck.length > 11 && peer.lastState) truck[11] = peer.lastState;
+			const saved = this.moves.get(peer.id);
+			if (!peer.joined || !saved) continue;
+			const truck = [peer.id, peer.nickname].concat(saved.move, [peer.owner ? "1" : "0"]);
+			if (truck.length > 11 && saved.state) truck[11] = saved.state;
 			try { target.send(encodeWire("TRUCK", truck)); } catch (_) { }
 		}
 	}
@@ -325,7 +339,7 @@ export class Room {
 			if (ws === target) continue;
 			const peer = ws.deserializeAttachment() || {};
 			if (!peer.joined || !peer.endpointIp || !peer.endpointPort) continue;
-			try { target.send(encodeWire("ENDPOINT", [peer.id, peer.nickname, peer.endpointIp, peer.endpointPort, peer.token])); } catch (_) { }
+			try { target.send(encodeWire("ENDPOINT", [peer.id, peer.nickname, peer.endpointIp, peer.endpointPort, peer.token, peer.lanIp || "", peer.lanPort || ""])); } catch (_) { }
 		}
 	}
 
@@ -416,6 +430,31 @@ function randomId() {
 	const bytes = new Uint8Array(16);
 	crypto.getRandomValues(bytes);
 	return Array.from(bytes).map(function (value) { return value.toString(16).padStart(2, "0"); }).join("").toUpperCase();
+}
+
+// Aceita o endereço informado pelo STUN quando bate com o IP que o Cloudflare enxerga. Se o aparelho conectou por IPv6
+// (comum em Wi-Fi no Brasil) não dá para comparar; nesse caso aceita qualquer IPv4 público.
+function endpointAllowed(address, signalIp) {
+	if (!isValidIPv4(address)) return false;
+	if (address === signalIp) return true;
+	return typeof signalIp === "string" && signalIp.indexOf(":") >= 0 && isPublicIPv4(address);
+}
+
+function isPublicIPv4(value) {
+	if (!isValidIPv4(value)) return false;
+	const o = value.split(".").map(Number);
+	if (o[0] === 0 || o[0] === 10 || o[0] === 127 || o[0] >= 224) return false;
+	if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return false;
+	if (o[0] === 169 && o[1] === 254) return false;
+	if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return false;
+	if (o[0] === 192 && (o[1] === 168 || (o[1] === 0 && o[2] === 0))) return false;
+	return true;
+}
+
+function isPrivateIPv4(value) {
+	if (!isValidIPv4(value)) return false;
+	const o = value.split(".").map(Number);
+	return o[0] === 10 || (o[0] === 172 && o[1] >= 16 && o[1] <= 31) || (o[0] === 192 && o[1] === 168);
 }
 
 function isValidIPv4(value) {
