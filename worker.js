@@ -7,6 +7,11 @@
  */
 
 const ROOM_ID_RE = /^[A-F0-9]{32}$/;
+const SKIN_PATH_RE = /^\/api\/rooms\/([A-F0-9]{32})\/skins\/([A-F0-9]{32})\/([A-Za-z0-9_-]{1,48})$/i;
+const MAX_SKIN_BYTES = 7 * 1024 * 1024;
+const MAX_PLAYER_SKIN_BYTES = 12 * 1024 * 1024;
+const MAX_ROOM_SKIN_BYTES = 128 * 1024 * 1024;
+const SKIN_CHUNK_BYTES = 1024 * 1024;
 
 export default {
 	async fetch(request, env) {
@@ -25,6 +30,11 @@ export default {
 			const target = new URL(request.url);
 			target.searchParams.set("room", roomId);
 			return room.fetch(new Request(target.toString(), request));
+		}
+		const skinMatch = url.pathname.match(SKIN_PATH_RE);
+		if (skinMatch && (request.method === "GET" || request.method === "PUT" || request.method === "DELETE")) {
+			const skinRoom = env.ROOMS.get(env.ROOMS.idFromName(skinMatch[1].toUpperCase()));
+			return skinRoom.fetch(request);
 		}
 		const inviteMatch = url.pathname.match(/^\/join\/([A-F0-9]{32})$/i);
 		if (inviteMatch && request.method === "GET") {
@@ -52,6 +62,8 @@ export class Room {
 	}
 
 	async fetch(request) {
+		const skinPath = new URL(request.url).pathname.match(SKIN_PATH_RE);
+		if (skinPath) return this.handleSkin(request, skinPath[2].toUpperCase(), skinPath[3]);
 		if (request.headers.get("Upgrade") !== "websocket") return new Response("Expected WebSocket", { status: 426 });
 		const roomId = new URL(request.url).searchParams.get("room");
 		if (!roomId || !ROOM_ID_RE.test(roomId)) return new Response("Invalid room code", { status: 400 });
@@ -141,9 +153,118 @@ export class Room {
 		if ((message[0] === "KICK" || message[0] === "BAN") && message.length >= 2 && peer.owner) {
 			return this.moderate(peer, message[0], message[1]);
 		}
+		if (message[0] === "SKIN_LIST") return this.sendSkinManifest(ws);
+		if (message[0] === "SKIN_DELETE" && message.length >= 2 && /^[A-Za-z0-9_-]{1,48}$/.test(message[1])) return this.removeSkin(peer.id, message[1], null);
 		if (message[0] === "LIST") {
 			const meta = await this.ctx.storage.get("room");
 			if (meta) ws.send(encodeWire("SERVER_LIST", [meta.name + " " + this.ctx.getWebSockets().length + "/" + meta.capacity]));
+		}
+	}
+
+	// ---- Skins: o servidor guarda a imagem de cada jogador (em pedaços de 1 MB) e avisa a sala com SKIN_AVAILABLE.
+	// Mesma API do servidor do Render, então o jogo funciona igual nos dois.
+	skinBlobKey(playerId, slot, hash, index) {
+		return "blob:" + playerId + ":" + slot + ":" + hash + ":" + index;
+	}
+
+	isAuthorizedPlayer(playerId, token) {
+		if (!playerId || !token) return false;
+		for (const ws of this.ctx.getWebSockets()) {
+			const peer = ws.deserializeAttachment() || {};
+			if (peer.joined && peer.id === playerId && peer.token === token) return true;
+		}
+		return false;
+	}
+
+	async handleSkin(request, targetId, slot) {
+		const playerId = request.headers.get("x-hts-player") || "";
+		const token = request.headers.get("x-hts-token") || "";
+		if (!this.isAuthorizedPlayer(playerId, token)) return new Response("Unauthorized", { status: 401 });
+		const metaKey = "skin:" + targetId + ":" + slot;
+		if (request.method === "DELETE") {
+			if (targetId !== playerId) return new Response("Forbidden", { status: 403 });
+			await this.removeSkin(playerId, slot, null);
+			return new Response("deleted");
+		}
+		if (request.method === "PUT") {
+			if (targetId !== playerId) return new Response("Forbidden", { status: 403 });
+			const type = (request.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+			if (type !== "image/png" && type !== "image/jpeg") return new Response("Only PNG/JPEG skins are accepted", { status: 415 });
+			if (Number(request.headers.get("content-length") || 0) > MAX_SKIN_BYTES) return new Response("Skin exceeds 7 MB", { status: 413 });
+			const body = new Uint8Array(await request.arrayBuffer());
+			if (body.length < 16 || body.length > MAX_SKIN_BYTES) return new Response("Invalid skin size", { status: 413 });
+			const validPng = body[0] === 0x89 && body[1] === 0x50 && body[2] === 0x4e && body[3] === 0x47 && body[4] === 0x0d && body[5] === 0x0a && body[6] === 0x1a && body[7] === 0x0a;
+			const validJpeg = body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff;
+			if ((type === "image/png" && !validPng) || (type === "image/jpeg" && !validJpeg)) return new Response("Image signature does not match Content-Type", { status: 415 });
+			const model = (request.headers.get("x-hts-model") || "").replace(/[^A-Za-z0-9 _().-]/g, "_").slice(0, 64);
+			const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body));
+			let hash = "";
+			for (let i = 0; i < digest.length; i++) hash += digest[i].toString(16).padStart(2, "0");
+			const old = await this.ctx.storage.get(metaKey);
+			let playerBytes = 0;
+			let roomBytes = 0;
+			const metas = await this.ctx.storage.list({ prefix: "skin:" });
+			for (const entry of metas.values()) {
+				roomBytes += entry.size;
+				if (entry.playerId === playerId) playerBytes += entry.size;
+			}
+			const nextPlayerBytes = playerBytes - (old ? old.size : 0) + body.length;
+			const nextRoomBytes = roomBytes - (old ? old.size : 0) + body.length;
+			if (nextPlayerBytes > MAX_PLAYER_SKIN_BYTES) return new Response("Player skin cache is limited to 12 MB", { status: 413 });
+			if (nextRoomBytes > MAX_ROOM_SKIN_BYTES) return new Response("Room skin cache is full", { status: 413 });
+			if (!old || old.hash !== hash || old.model !== model || old.type !== type) {
+				const count = Math.ceil(body.length / SKIN_CHUNK_BYTES);
+				const entries = {};
+				for (let i = 0; i < count; i++) entries[this.skinBlobKey(targetId, slot, hash, i)] = body.slice(i * SKIN_CHUNK_BYTES, (i + 1) * SKIN_CHUNK_BYTES);
+				await this.ctx.storage.put(entries);
+				await this.ctx.storage.put(metaKey, { playerId: targetId, slot: slot, hash: hash, size: body.length, type: type, model: model, chunks: count });
+				if (old && old.hash !== hash) await this.deleteSkinBlobs(old);
+				this.broadcast(encodeWire("SKIN_AVAILABLE", [targetId, slot, hash, body.length, type, model]), null);
+			}
+			return new Response(JSON.stringify({ hash: hash, size: body.length }), { headers: { "content-type": "application/json; charset=utf-8" } });
+		}
+		const meta = await this.ctx.storage.get(metaKey);
+		if (!meta) return new Response("Not found", { status: 404 });
+		const keys = [];
+		for (let i = 0; i < meta.chunks; i++) keys.push(this.skinBlobKey(meta.playerId, meta.slot, meta.hash, i));
+		const parts = await this.ctx.storage.get(keys);
+		const bytes = new Uint8Array(meta.size);
+		let offset = 0;
+		for (let i = 0; i < keys.length; i++) {
+			const part = parts.get(keys[i]);
+			if (!part) return new Response("Not found", { status: 404 });
+			const chunk = part instanceof Uint8Array ? part : new Uint8Array(part);
+			bytes.set(chunk, offset);
+			offset += chunk.length;
+		}
+		return new Response(bytes, { headers: { "content-type": meta.type, "content-length": String(meta.size), "x-hts-sha256": meta.hash, "cache-control": "no-store", "x-content-type-options": "nosniff" } });
+	}
+
+	async deleteSkinBlobs(meta) {
+		const keys = [];
+		for (let i = 0; i < meta.chunks; i++) keys.push(this.skinBlobKey(meta.playerId, meta.slot, meta.hash, i));
+		if (keys.length > 0) await this.ctx.storage.delete(keys);
+	}
+
+	async removeSkin(playerId, slot, excluded) {
+		const metaKey = "skin:" + playerId + ":" + slot;
+		const meta = await this.ctx.storage.get(metaKey);
+		if (!meta) return;
+		await this.deleteSkinBlobs(meta);
+		await this.ctx.storage.delete(metaKey);
+		this.broadcast(encodeWire("SKIN_REMOVED", [playerId, slot]), excluded || null);
+	}
+
+	async removeAllPlayerSkins(playerId, excluded) {
+		if (!playerId) return;
+		const metas = await this.ctx.storage.list({ prefix: "skin:" + playerId + ":" });
+		for (const meta of metas.values()) await this.removeSkin(meta.playerId, meta.slot, excluded);
+	}
+
+	async sendSkinManifest(ws) {
+		const metas = await this.ctx.storage.list({ prefix: "skin:" });
+		for (const meta of metas.values()) {
+			try { ws.send(encodeWire("SKIN_AVAILABLE", [meta.playerId, meta.slot, meta.hash, meta.size, meta.type, meta.model])); } catch (_) { }
 		}
 	}
 
@@ -234,6 +355,7 @@ export class Room {
 		peer.owner = false;
 		try { ws.serializeAttachment(peer); } catch (_) { }
 		const room = await this.ctx.storage.get("room");
+		try { await this.removeAllPlayerSkins(peer.id, ws); } catch (_) { }
 		if (wasOwner) {
 			const candidates = [];
 			for (const other of this.ctx.getWebSockets()) {
@@ -270,6 +392,7 @@ export class Room {
 
 			await this.ctx.storage.delete("room");
 			await this.ctx.storage.delete("banned");
+			try { await this.ctx.storage.deleteAll(); } catch (_) { }
 			await this.updateDirectory(null, peer.roomId);
 			for (const other of this.ctx.getWebSockets()) {
 				if (other === ws) continue;
