@@ -24,6 +24,7 @@ const MAX_PLAYER_SKIN_BYTES = 12 * 1024 * 1024;
 const MAX_ROOM_SKIN_BYTES = 64 * 1024 * 1024;
 const SKIN_CHUNK = 1024 * 1024;
 const ALARM_MS = 60000;
+const GRACE_MS = 45000;
 const DIRECTORY_TTL_MS = 150000;
 const SLOT_RE = /^[A-Za-z0-9_-]{1,48}$/;
 const SKIN_PATH_RE = /^\/api\/rooms\/([A-F0-9]{32})\/skins(?:\/([A-F0-9]{32})\/([A-Za-z0-9_-]{1,48}))?$/i;
@@ -107,6 +108,13 @@ export class Room {
 		}
 		if (!peer.joined) return this.join(ws, peer, message);
 
+		if (message[0] === "BYE") {
+			peer.noGrace = true;
+			try { ws.serializeAttachment(peer); } catch (_) { }
+			await this.removePeer(ws, false);
+			try { ws.close(1000, "bye"); } catch (_) { }
+			return;
+		}
 		if (message[0] === "CHAT" && message.length >= 2) {
 			const text = (message[1] || "").substring(0, 500);
 			return this.broadcast(encodeWire("CHAT", [peer.nickname, text]), null);
@@ -145,13 +153,14 @@ export class Room {
 
 	async join(ws, peer, message) {
 		const command = message[0];
+		if (command === "RESUME") return this.resume(ws, peer, message);
 		const create = command === "CREATE";
 		if (!create && command !== "JOIN") return this.fail(ws, "Envie CREATE ou JOIN primeiro.");
 		const nickname = (message[1] || "").trim();
 		if (!nickname || nickname.length > 24) return this.fail(ws, "Nickname inválido.");
 		let meta = await this.ctx.storage.get("room");
 		if (create) {
-			if (meta && this.joinedCount() === 0) { await this.closeRoom(meta.id); meta = null; }
+			if (meta && this.joinedCount() === 0 && (await this.graceCount()) === 0) { await this.closeRoom(meta.id); meta = null; }
 			if (meta) return this.fail(ws, "Este código de sala já está em uso.");
 			const capacity = parseInt(message[3], 10);
 			const roomName = (message[4] || ("Sala de " + nickname)).trim().substring(0, 40);
@@ -161,8 +170,8 @@ export class Room {
 			peer.owner = true;
 		} else {
 			if (!meta) return this.fail(ws, "Sala encerrada ou código inválido.");
-			if (this.joinedCount() === 0) { await this.closeRoom(meta.id); return this.fail(ws, "Sala encerrada ou código inválido."); }
-			if (this.joinedCount() >= meta.capacity) return this.fail(ws, "A sala está cheia.");
+			if (this.joinedCount() === 0 && (await this.graceCount()) === 0) { await this.closeRoom(meta.id); return this.fail(ws, "Sala encerrada ou código inválido."); }
+			if (this.joinedCount() + (await this.graceCount()) >= meta.capacity) return this.fail(ws, "A sala está cheia.");
 			const banned = await this.ctx.storage.get("banned") || [];
 			if (banned.indexOf(nickname.toLowerCase()) >= 0) return this.fail(ws, "Nickname banido desta sala.");
 		}
@@ -186,20 +195,90 @@ export class Room {
 	}
 
 	async webSocketClose(ws) {
-		await this.removePeer(ws);
+		await this.removePeer(ws, true);
 		try { ws.close(1000, "closing"); } catch (_) { }
 	}
 
 	async webSocketError(ws) {
-		return this.removePeer(ws);
+		return this.removePeer(ws, true);
 	}
 
-	async removePeer(ws) {
+	// Queda de conexão (sem BYE, sem expulsão): guarda a vaga por GRACE_MS para o jogador voltar com RESUME.
+	async removePeer(ws, allowGrace) {
 		const peer = ws.deserializeAttachment() || {};
 		if (!peer.joined) return;
-		this.moves.delete(peer.id);
 		peer.joined = false;
 		try { ws.serializeAttachment(peer); } catch (_) { }
+		if (allowGrace && !peer.noGrace) { await this.startGrace(peer); return; }
+		await this.leaveNow(peer, ws);
+	}
+
+	async startGrace(peer) {
+		await this.ctx.storage.put("grace:" + peer.id, { id: peer.id, nickname: peer.nickname, token: peer.token, owner: !!peer.owner, joinedAt: peer.joinedAt || 0, roomId: peer.roomId, until: Date.now() + GRACE_MS });
+		await this.scheduleAlarm();
+		const room = await this.ctx.storage.get("room");
+		if (room) await this.updateDirectory(room);
+	}
+
+	async graceCount() {
+		const list = await this.ctx.storage.list({ prefix: "grace:" });
+		return list.size;
+	}
+
+	async scheduleAlarm() {
+		let next = Date.now() + ALARM_MS;
+		try {
+			const list = await this.ctx.storage.list({ prefix: "grace:" });
+			for (const rec of list.values()) if (rec.until < next) next = rec.until;
+			await this.ctx.storage.setAlarm(Math.max(next, Date.now() + 200));
+		} catch (_) { }
+	}
+
+	// Volta à mesma vaga (mesmo id, token, dono e skins) depois de uma queda de conexão.
+	async resume(ws, peer, message) {
+		const id = message[1] || "";
+		const token = message[2] || "";
+		const meta = await this.ctx.storage.get("room");
+		const rec = id ? await this.ctx.storage.get("grace:" + id) : null;
+		let live = null;
+		if (!rec && id) {
+			for (const w of this.ctx.getWebSockets()) {
+				if (w === ws) continue;
+				const p = w.deserializeAttachment() || {};
+				if (p.joined && p.id === id && p.token === token) { live = { w: w, p: p }; break; }
+			}
+		}
+		const base = rec || (live && live.p);
+		if (!meta || !base || base.token !== token) {
+			try { ws.send(encodeWire("RESUME_FAILED", [])); ws.close(1000, "resume failed"); } catch (_) { }
+			return;
+		}
+		if (live) {
+			live.p.joined = false;
+			live.p.noGrace = true;
+			try { live.w.serializeAttachment(live.p); } catch (_) { }
+			try { live.w.close(1000, "replaced"); } catch (_) { }
+		}
+		if (rec) await this.ctx.storage.delete("grace:" + id);
+		peer.id = base.id;
+		peer.token = base.token;
+		peer.nickname = base.nickname;
+		peer.owner = !!base.owner;
+		peer.joinedAt = base.joinedAt || Date.now();
+		peer.roomId = peer.roomId || meta.id;
+		peer.joined = true;
+		if (!meta.ownerId) { peer.owner = true; meta.ownerId = peer.id; await this.ctx.storage.put("room", meta); }
+		ws.serializeAttachment(peer);
+		await this.scheduleAlarm();
+		await this.updateDirectory(meta);
+		ws.send(encodeWire("WELCOME", [peer.id, "0", peer.token, peer.owner ? "1" : "0"]));
+		this.sendRoster(ws);
+		this.sendSnapshots(ws);
+	}
+
+	// Saída definitiva do jogador (BYE, expulsão ou fim do período de graça).
+	async leaveNow(peer, ws) {
+		this.moves.delete(peer.id);
 		await this.removeAllSkins(peer.id, ws);
 
 		const room = await this.ctx.storage.get("room");
@@ -214,6 +293,13 @@ export class Room {
 		if (peer.owner) {
 			if (!room || others.length === 0) {
 				// Ninguém sobrou: aí sim a sala fecha.
+				if (room && (await this.graceCount()) > 0) {
+					// Só sobraram jogadores reconectando: mantém a sala aberta, sem dono por enquanto.
+					room.ownerId = "";
+					await this.ctx.storage.put("room", room);
+					await this.updateDirectory(room);
+					return;
+				}
 				await this.closeRoom(peer.roomId);
 				return;
 			}
@@ -232,7 +318,7 @@ export class Room {
 		}
 		this.broadcast(encodeWire("PLAYER_LEFT", [peer.id]), ws);
 		if (room) {
-			if (this.joinedCount() === 0) await this.closeRoom(room.id);
+			if (this.joinedCount() === 0 && (await this.graceCount()) === 0) await this.closeRoom(room.id);
 			else await this.updateDirectory(room);
 		}
 	}
@@ -242,6 +328,10 @@ export class Room {
 		await this.clearAllSkins();
 		await this.ctx.storage.delete("room");
 		await this.ctx.storage.delete("banned");
+		try {
+			const graces = await this.ctx.storage.list({ prefix: "grace:" });
+			for (const key of graces.keys()) await this.ctx.storage.delete(key);
+		} catch (_) { }
 		try { await this.ctx.storage.deleteAlarm(); } catch (_) { }
 		await this.updateDirectory(null, roomId);
 	}
@@ -249,11 +339,18 @@ export class Room {
 	// Manutenção a cada 60 s enquanto a sala existe: renova a entrada no diretório
 	// ou fecha a sala se não sobrou ninguém conectado (conexões que caíram sem aviso).
 	async alarm() {
+		const now = Date.now();
+		const graces = await this.ctx.storage.list({ prefix: "grace:" });
+		for (const [key, rec] of graces) {
+			if (rec.until > now) continue;
+			await this.ctx.storage.delete(key);
+			await this.leaveNow(rec, null);
+		}
 		const room = await this.ctx.storage.get("room");
 		if (!room) return;
-		if (this.joinedCount() === 0) { await this.closeRoom(room.id); return; }
+		if (this.joinedCount() === 0 && (await this.graceCount()) === 0) { await this.closeRoom(room.id); return; }
 		await this.updateDirectory(room);
-		try { await this.ctx.storage.setAlarm(Date.now() + ALARM_MS); } catch (_) { }
+		await this.scheduleAlarm();
 	}
 
 	async moderate(owner, command, targetId) {
@@ -265,6 +362,8 @@ export class Room {
 				if (banned.indexOf(target.nickname.toLowerCase()) < 0) banned.push(target.nickname.toLowerCase());
 				await this.ctx.storage.put("banned", banned);
 			}
+			target.noGrace = true;
+			try { ws.serializeAttachment(target); } catch (_) { }
 			try { ws.send(encodeWire("ERROR", [command === "BAN" ? "Banido pelo dono da sala." : "Expulso pelo dono da sala."])); ws.close(1008, command); } catch (_) { }
 		}
 	}
