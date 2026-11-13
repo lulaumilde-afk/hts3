@@ -106,7 +106,7 @@ export class Room {
 		}
 		if (message[0] === "LIST") {
 			const meta = await this.ctx.storage.get("room");
-			if (meta) ws.send(encodeWire("SERVER_LIST", [meta.name + " " + this.ctx.getWebSockets().length + "/" + meta.capacity]));
+			if (meta) ws.send(encodeWire("SERVER_LIST", [meta.name + " " + this.joinedCount() + "/" + meta.capacity]));
 		}
 	}
 
@@ -145,7 +145,7 @@ export class Room {
 			peer.owner = true;
 		} else {
 			if (!meta) return this.fail(ws, "Sala encerrada ou código inválido.");
-			if (this.ctx.getWebSockets().length >= meta.capacity) return this.fail(ws, "A sala está cheia.");
+			if (this.joinedCount() >= meta.capacity) return this.fail(ws, "A sala está cheia.");
 			const banned = await this.ctx.storage.get("banned") || [];
 			if (banned.indexOf(nickname.toLowerCase()) >= 0) return this.fail(ws, "Nickname banido desta sala.");
 		}
@@ -189,7 +189,7 @@ export class Room {
 			if (other === ws) continue;
 			if (other.readyState === 2 || other.readyState === 3) continue;
 			const otherPeer = other.deserializeAttachment() || {};
-			if (otherPeer.joined) others.push({ ws: other, peer: otherPeer });
+			if (otherPeer.joined && otherPeer.id !== peer.id) others.push({ ws: other, peer: otherPeer });
 		}
 
 		if (peer.owner) {
@@ -208,7 +208,8 @@ export class Room {
 			room.ownerId = next.peer.id;
 			await this.ctx.storage.put("room", room);
 			this.broadcast(encodeWire("PLAYER_LEFT", [peer.id]), ws);
-			this.broadcast(encodeWire("OWNER", [next.peer.id]), ws);
+			this.broadcast(encodeWire("HOST_CHANGED", [next.peer.id, next.peer.nickname, room.name, String(room.capacity)]), ws);
+			this.broadcast(encodeWire("DIRECT_MODE", ["0"]), ws);
 			await this.updateDirectory(room);
 			return;
 		}
@@ -227,6 +228,16 @@ export class Room {
 			}
 			try { ws.send(encodeWire("ERROR", [command === "BAN" ? "Banido pelo dono da sala." : "Expulso pelo dono da sala."])); ws.close(1008, command); } catch (_) { }
 		}
+	}
+
+	joinedCount() {
+		let n = 0;
+		for (const w of this.ctx.getWebSockets()) {
+			if (w.readyState === 2 || w.readyState === 3) continue;
+			const p = w.deserializeAttachment() || {};
+			if (p.joined) n++;
+		}
+		return n;
 	}
 
 	sendRoster(target) {
