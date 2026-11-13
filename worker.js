@@ -23,6 +23,8 @@ const MAX_SKIN_BYTES = 7 * 1024 * 1024;
 const MAX_PLAYER_SKIN_BYTES = 12 * 1024 * 1024;
 const MAX_ROOM_SKIN_BYTES = 64 * 1024 * 1024;
 const SKIN_CHUNK = 1024 * 1024;
+const ALARM_MS = 60000;
+const DIRECTORY_TTL_MS = 150000;
 const SLOT_RE = /^[A-Za-z0-9_-]{1,48}$/;
 const SKIN_PATH_RE = /^\/api\/rooms\/([A-F0-9]{32})\/skins(?:\/([A-F0-9]{32})\/([A-Za-z0-9_-]{1,48}))?$/i;
 
@@ -149,6 +151,7 @@ export class Room {
 		if (!nickname || nickname.length > 24) return this.fail(ws, "Nickname inválido.");
 		let meta = await this.ctx.storage.get("room");
 		if (create) {
+			if (meta && this.joinedCount() === 0) { await this.closeRoom(meta.id); meta = null; }
 			if (meta) return this.fail(ws, "Este código de sala já está em uso.");
 			const capacity = parseInt(message[3], 10);
 			const roomName = (message[4] || ("Sala de " + nickname)).trim().substring(0, 40);
@@ -158,6 +161,7 @@ export class Room {
 			peer.owner = true;
 		} else {
 			if (!meta) return this.fail(ws, "Sala encerrada ou código inválido.");
+			if (this.joinedCount() === 0) { await this.closeRoom(meta.id); return this.fail(ws, "Sala encerrada ou código inválido."); }
 			if (this.joinedCount() >= meta.capacity) return this.fail(ws, "A sala está cheia.");
 			const banned = await this.ctx.storage.get("banned") || [];
 			if (banned.indexOf(nickname.toLowerCase()) >= 0) return this.fail(ws, "Nickname banido desta sala.");
@@ -172,6 +176,7 @@ export class Room {
 		if (peer.owner) meta.ownerId = peer.id;
 		ws.serializeAttachment(peer);
 		await this.ctx.storage.put("room", meta);
+		try { if ((await this.ctx.storage.getAlarm()) == null) await this.ctx.storage.setAlarm(Date.now() + ALARM_MS); } catch (_) { }
 		await this.updateDirectory(meta);
 		ws.send(encodeWire("WELCOME", [peer.id, "0", peer.token, peer.owner ? "1" : "0"]));
 		if (create) ws.send(encodeWire("ROOM_CREATED", []));
@@ -209,10 +214,7 @@ export class Room {
 		if (peer.owner) {
 			if (!room || others.length === 0) {
 				// Ninguém sobrou: aí sim a sala fecha.
-				await this.clearAllSkins();
-				await this.ctx.storage.delete("room");
-				await this.ctx.storage.delete("banned");
-				await this.updateDirectory(null, peer.roomId);
+				await this.closeRoom(peer.roomId);
 				return;
 			}
 			// O dono caiu, mas tem gente na sala: o jogador mais antigo vira o novo dono.
@@ -229,7 +231,29 @@ export class Room {
 			return;
 		}
 		this.broadcast(encodeWire("PLAYER_LEFT", [peer.id]), ws);
-		if (room) await this.updateDirectory(room);
+		if (room) {
+			if (this.joinedCount() === 0) await this.closeRoom(room.id);
+			else await this.updateDirectory(room);
+		}
+	}
+
+	// Fecha a sala por completo: skins, dados e entrada no diretório.
+	async closeRoom(roomId) {
+		await this.clearAllSkins();
+		await this.ctx.storage.delete("room");
+		await this.ctx.storage.delete("banned");
+		try { await this.ctx.storage.deleteAlarm(); } catch (_) { }
+		await this.updateDirectory(null, roomId);
+	}
+
+	// Manutenção a cada 60 s enquanto a sala existe: renova a entrada no diretório
+	// ou fecha a sala se não sobrou ninguém conectado (conexões que caíram sem aviso).
+	async alarm() {
+		const room = await this.ctx.storage.get("room");
+		if (!room) return;
+		if (this.joinedCount() === 0) { await this.closeRoom(room.id); return; }
+		await this.updateDirectory(room);
+		try { await this.ctx.storage.setAlarm(Date.now() + ALARM_MS); } catch (_) { }
 	}
 
 	async moderate(owner, command, targetId) {
@@ -426,7 +450,7 @@ export class Room {
 
 	async updateDirectory(meta, removeId) {
 		const directory = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
-		const body = meta ? JSON.stringify({ id: meta.id, name: meta.name, capacity: meta.capacity, count: this.ctx.getWebSockets().filter(function (ws) { const peer = ws.deserializeAttachment() || {}; return peer.joined; }).length, visibility: meta.visibility }) : JSON.stringify({ id: removeId });
+		const body = meta ? JSON.stringify({ id: meta.id, name: meta.name, capacity: meta.capacity, count: this.ctx.getWebSockets().filter(function (ws) { const peer = ws.deserializeAttachment() || {}; return peer.joined; }).length, visibility: meta.visibility, updated: Date.now() }) : JSON.stringify({ id: removeId });
 		try {
 			await directory.fetch(meta ? "https://directory/upsert" : "https://directory/remove", { method: "POST", body: body });
 		} catch (_) { }
@@ -444,11 +468,14 @@ export class Directory {
 		if (request.method === "GET" && url.pathname === "/list") {
 			const values = await this.ctx.storage.list({ prefix: "room:" });
 			const lines = [];
-			for (const entry of values.values()) {
-				const room = entry;
-				if (room.visibility !== "public" || room.count < 1) continue;
+			const stale = [];
+			const now = Date.now();
+			for (const [key, room] of values) {
+				if (!room || !room.updated || now - room.updated > DIRECTORY_TTL_MS || room.count < 1) { stale.push(key); continue; }
+				if (room.visibility !== "public") continue;
 				lines.push([b64(room.id), b64(room.name), room.count, room.capacity].join("|"));
 			}
+			for (let i = 0; i < stale.length; i += 100) await this.ctx.storage.delete(stale.slice(i, i + 100));
 			return new Response(lines.join("\n"), { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
 		}
 		if (request.method === "POST" && (url.pathname === "/upsert" || url.pathname === "/remove")) {
