@@ -1,12 +1,24 @@
 /*
  * HTS Online Multiplayer relay for Cloudflare Workers + Durable Objects.
- * The room creator starts as logical owner; if they leave, ownership moves to
- * a randomly selected connected player. Durable Objects handle room discovery,
- * signaling, and fallback relay. Direct UDP can reduce game-packet traffic, but
- * it exposes public endpoint addresses to room members and may fail behind NATs.
+ * The room creator is the logical owner. Durable Objects relay game packets
+ * so phones on different networks do not need inbound ports or expose peer IPs.
+ *
+ * Correções desta versão:
+ *  - O "attachment" do WebSocket (limite de 2 KB do Cloudflare) guarda só dados pequenos.
+ *    O último MOVE/estado de cada jogador fica na memória do Durable Object. Antes, um MOVE
+ *    grande (rodas do reboque, áudio, reboques extras) estourava o limite, dava exceção e
+ *    derrubava a conexão, e se fosse o dono, a sala inteira fechava.
+ *  - Se o dono cair, a sala NÃO fecha: o jogador mais antigo vira dono (mensagem OWNER).
+ *    A sala só fecha quando não sobra ninguém.
+ *  - Pacote ruim de um jogador já dentro da sala é ignorado em vez de derrubar a conexão.
+ *  - MOVE é repassado sem decodificar/recodificar tudo (menos CPU a 30 pacotes por segundo).
  */
 
 const ROOM_ID_RE = /^[A-F0-9]{32}$/;
+const WIRE_CHARS_RE = /^[A-Za-z0-9+\/=\t]*$/;
+const MAX_FIELD_B64 = 5600;
+const B64_ONE = "MQ==";
+const B64_ZERO = "MA==";
 
 export default {
 	async fetch(request, env) {
@@ -46,6 +58,12 @@ export class Room {
 	constructor(ctx, env) {
 		this.ctx = ctx;
 		this.env = env;
+		// Último MOVE de cada jogador (id -> { fields, state }). Só em memória: não cabe no attachment (2 KB).
+		this.moves = new Map();
+		try {
+			// Responde "ping" -> "pong" sem acordar o objeto (útil se o cliente passar a mandar ping).
+			this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+		} catch (_) { }
 	}
 
 	async fetch(request) {
@@ -56,85 +74,32 @@ export class Room {
 		const client = pair[0];
 		const server = pair[1];
 		this.ctx.acceptWebSocket(server);
-		server.serializeAttachment({ roomId: roomId, id: "", nickname: "", owner: false, joined: false, lastMove: null, lastState: "", signalIp: request.headers.get("CF-Connecting-IP") || "", endpointIp: "", endpointPort: 0, p2pReady: false });
+		server.serializeAttachment({ roomId: roomId, id: "", nickname: "", token: "", owner: false, joined: false, joinedAt: 0 });
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
 	async webSocketMessage(ws, raw) {
-		if (typeof raw !== "string" || raw.length > 20000) return this.fail(ws, "Pacote inválido.");
-		const message = decodeWire(raw);
-		if (!message || message.length < 1) return this.fail(ws, "Pacote inválido.");
 		const peer = ws.deserializeAttachment() || {};
-		if (!peer.joined) return this.join(ws, peer, message);
-		if (message[0] === "P2P_READY") {
-			peer.p2pReady = true;
-			ws.serializeAttachment(peer);
-			const room = await this.ctx.storage.get("room");
-			if (!room) return;
-			const peers = this.ctx.getWebSockets().map(function (socket) { return socket.deserializeAttachment() || {}; }).filter(function (state) { return state.joined; });
-			if (peers.length > 1 && peers.every(function (state) { return state.p2pReady && state.endpointIp && state.endpointPort > 0; })) {
-				room.directMode = true;
-				await this.ctx.storage.put("room", room);
-				this.broadcastJoined(encodeWire("DIRECT_MODE", ["1"]), null);
-			}
+		if (typeof raw !== "string" || raw.length > 20000) {
+			if (!peer.joined) return this.fail(ws, "Pacote inválido.");
 			return;
 		}
-		if (message[0] === "P2P_FALLBACK") {
-			return this.disableDirectMode(peer.roomId);
-		}
+		// Caminho rápido: MOVE de quem já está na sala é repassado sem decodificar.
+		if (peer.joined && raw.startsWith("MOVE\t")) return this.relayMove(ws, peer, raw);
 
-		if (message[0] === "MOVE" && message.length >= 7 && message.length <= 32) {
-			const room = await this.ctx.storage.get("room");
-			if (room && room.directMode) return;
-			const move = message.slice(1);
-			if (move.some(function (value) { return value.length > 4096; })) return;
-			peer.lastMove = move;
-			if (move.length > 9 && move[9]) peer.lastState = move[9];
-			ws.serializeAttachment(peer);
-			const truck = [peer.id, peer.nickname].concat(move, [peer.owner ? "1" : "0"]);
-			return this.broadcast(encodeWire("TRUCK", truck), ws);
+		const message = decodeWire(raw);
+		if (!message || message.length < 1) {
+			if (!peer.joined) return this.fail(ws, "Pacote inválido.");
+			return;
 		}
+		if (!peer.joined) return this.join(ws, peer, message);
+
 		if (message[0] === "CHAT" && message.length >= 2) {
-			const room = await this.ctx.storage.get("room");
-			if (room && room.directMode) return;
 			const text = (message[1] || "").substring(0, 500);
 			return this.broadcast(encodeWire("CHAT", [peer.nickname, text]), null);
 		}
 		if (message[0] === "VOICE" && message.length >= 2 && message[1].length <= 4096) {
-			const room = await this.ctx.storage.get("room");
-			if (room && room.directMode) return;
 			return this.broadcast(encodeWire("VOICE", [message[1]]), ws);
-		}
-		if (message[0] === "TRAFFIC" && message.length >= 3 && message.length <= 4 && peer.owner) {
-			const room = await this.ctx.storage.get("room");
-			if (room && room.directMode) return;
-			return this.broadcast(encodeWire("TRAFFIC", message.slice(1)), ws);
-		}
-		if (message[0] === "ENDPOINT" && message.length >= 3) {
-			const port = parseInt(message[2], 10);
-			const address = message[1];
-			if (!isValidIPv4(address) || address !== peer.signalIp || !Number.isFinite(port) || port < 1 || port > 65535) return;
-			peer.endpointIp = address;
-			peer.endpointPort = port;
-			peer.p2pReady = false;
-			ws.serializeAttachment(peer);
-			const room = await this.ctx.storage.get("room");
-			if (room) {
-				room.directMode = false;
-				for (const other of this.ctx.getWebSockets()) {
-					const state = other.deserializeAttachment() || {};
-					if (state.joined) {
-						state.p2pReady = false;
-						other.serializeAttachment(state);
-					}
-				}
-				await this.ctx.storage.put("room", room);
-				this.broadcastJoined(encodeWire("DIRECT_MODE", ["0"]), null);
-			}
-			const endpoint = encodeWire("ENDPOINT", [peer.id, peer.nickname, address, port, peer.token]);
-			this.broadcastJoined(endpoint, ws);
-			this.sendPeerEndpoints(ws);
-			return;
 		}
 		if ((message[0] === "KICK" || message[0] === "BAN") && message.length >= 2 && peer.owner) {
 			return this.moderate(peer, message[0], message[1]);
@@ -143,6 +108,24 @@ export class Room {
 			const meta = await this.ctx.storage.get("room");
 			if (meta) ws.send(encodeWire("SERVER_LIST", [meta.name + " " + this.ctx.getWebSockets().length + "/" + meta.capacity]));
 		}
+	}
+
+	relayMove(ws, peer, raw) {
+		if (!WIRE_CHARS_RE.test(raw)) return;
+		const parts = raw.split("\t");
+		if (parts.length < 7 || parts.length > 32) return;
+		for (let i = 1; i < parts.length; i++) {
+			if (parts[i].length > MAX_FIELD_B64) return;
+		}
+		const fields = parts.slice(1);
+		const previous = this.moves.get(peer.id);
+		const state = fields.length > 9 && fields[9] ? fields[9] : (previous ? previous.state : "");
+		this.moves.set(peer.id, { fields: fields, state: state });
+		this.broadcast(this.truckLine(peer, fields), ws);
+	}
+
+	truckLine(peer, fields) {
+		return "TRUCK\t" + b64(peer.id) + "\t" + b64(peer.nickname) + "\t" + fields.join("\t") + "\t" + (peer.owner ? B64_ONE : B64_ZERO);
 	}
 
 	async join(ws, peer, message) {
@@ -158,7 +141,7 @@ export class Room {
 			const roomName = (message[4] || ("Sala de " + nickname)).trim().substring(0, 40);
 			const visibility = message[5] === "public" ? "public" : "private";
 			if (!Number.isFinite(capacity) || capacity < 2 || capacity > 64) return this.fail(ws, "Capacidade inválida (2 a 64).");
-			meta = { id: peer.roomId, name: roomName || ("Sala de " + nickname), capacity: capacity, visibility: visibility, ownerId: "", directMode: false };
+			meta = { id: peer.roomId, name: roomName || ("Sala de " + nickname), capacity: capacity, visibility: visibility, ownerId: "" };
 			peer.owner = true;
 		} else {
 			if (!meta) return this.fail(ws, "Sala encerrada ou código inválido.");
@@ -171,42 +154,22 @@ export class Room {
 		peer.token = randomId();
 		peer.nickname = nickname;
 		peer.joined = true;
+		peer.joinedAt = Date.now();
 		peer.roomId = peer.roomId || meta.id;
-		peer.p2pReady = false;
-		const candidateIp = create ? message[6] : message[3];
-		const candidatePort = parseInt(create ? message[7] : message[4], 10);
-		if (isValidIPv4(candidateIp) && candidateIp === peer.signalIp && Number.isFinite(candidatePort) && candidatePort > 0 && candidatePort <= 65535) {
-			peer.endpointIp = candidateIp;
-			peer.endpointPort = candidatePort;
-		} else {
-			peer.endpointIp = "";
-			peer.endpointPort = 0;
-		}
 		if (peer.owner) meta.ownerId = peer.id;
-		meta.directMode = false;
-		for (const other of this.ctx.getWebSockets()) {
-			if (other === ws) continue;
-			const state = other.deserializeAttachment() || {};
-			if (state.joined) {
-				state.p2pReady = false;
-				other.serializeAttachment(state);
-			}
-		}
 		ws.serializeAttachment(peer);
 		await this.ctx.storage.put("room", meta);
 		await this.updateDirectory(meta);
-		ws.send(encodeWire("WELCOME", [peer.id, "0", peer.token, peer.owner ? "1" : "0", meta.ownerId]));
+		ws.send(encodeWire("WELCOME", [peer.id, "0", peer.token, peer.owner ? "1" : "0"]));
 		if (create) ws.send(encodeWire("ROOM_CREATED", []));
 		this.sendRoster(ws);
 		this.sendSnapshots(ws);
-		this.sendPeerEndpoints(ws);
-		if (!create) this.broadcastJoined(encodeWire("DIRECT_MODE", ["0"]), ws);
 		if (!create) this.broadcast(encodeWire("PLAYER_JOINED", [peer.id, peer.nickname]), ws);
-		if (peer.endpointIp && peer.endpointPort > 0) this.broadcastJoined(encodeWire("ENDPOINT", [peer.id, peer.nickname, peer.endpointIp, peer.endpointPort, peer.token]), ws);
 	}
 
 	async webSocketClose(ws) {
-		return this.removePeer(ws);
+		await this.removePeer(ws);
+		try { ws.close(1000, "closing"); } catch (_) { }
 	}
 
 	async webSocketError(ws) {
@@ -216,75 +179,41 @@ export class Room {
 	async removePeer(ws) {
 		const peer = ws.deserializeAttachment() || {};
 		if (!peer.joined) return;
-		const wasOwner = !!peer.owner;
+		this.moves.delete(peer.id);
 		peer.joined = false;
-		peer.owner = false;
 		try { ws.serializeAttachment(peer); } catch (_) { }
+
 		const room = await this.ctx.storage.get("room");
-		if (wasOwner) {
-			const candidates = [];
-			for (const other of this.ctx.getWebSockets()) {
-				if (other === ws) continue;
-				const state = other.deserializeAttachment() || {};
-				if (state.joined) candidates.push({ socket: other, peer: state });
-			}
+		const others = [];
+		for (const other of this.ctx.getWebSockets()) {
+			if (other === ws) continue;
+			if (other.readyState === 2 || other.readyState === 3) continue;
+			const otherPeer = other.deserializeAttachment() || {};
+			if (otherPeer.joined) others.push({ ws: other, peer: otherPeer });
+		}
 
-			if (room && candidates.length > 0) {
-				const selected = candidates[Math.floor(Math.random() * candidates.length)];
-				room.ownerId = selected.peer.id;
-				room.directMode = false;
-				for (const other of this.ctx.getWebSockets()) {
-					const state = other.deserializeAttachment() || {};
-					if (!state.joined) continue;
-					state.owner = other === selected.socket;
-					state.p2pReady = false;
-					try { other.serializeAttachment(state); } catch (_) { }
-				}
-				await this.ctx.storage.put("room", room);
-
-				const left = encodeWire("PLAYER_LEFT", [peer.id]);
-				const changed = encodeWire("HOST_CHANGED", [selected.peer.id, selected.peer.nickname, room.name, room.capacity]);
-				const directMode = encodeWire("DIRECT_MODE", ["0"]);
-				for (const other of this.ctx.getWebSockets()) {
-					if (other === ws) continue;
-					const state = other.deserializeAttachment() || {};
-					if (!state.joined) continue;
-					try { other.send(left); other.send(changed); other.send(directMode); } catch (_) { }
-				}
-				await this.updateDirectory(room);
+		if (peer.owner) {
+			if (!room || others.length === 0) {
+				// Ninguém sobrou: aí sim a sala fecha.
+				await this.ctx.storage.delete("room");
+				await this.ctx.storage.delete("banned");
+				await this.updateDirectory(null, peer.roomId);
 				return;
 			}
-
-			await this.ctx.storage.delete("room");
-			await this.ctx.storage.delete("banned");
-			await this.updateDirectory(null, peer.roomId);
-			for (const other of this.ctx.getWebSockets()) {
-				if (other === ws) continue;
-				try { other.send(encodeWire("ERROR", ["O host saiu e a sala não pôde ser transferida."])); other.close(1000, "room closed"); } catch (_) { }
-			}
+			// O dono caiu, mas tem gente na sala: o jogador mais antigo vira o novo dono.
+			others.sort(function (a, b) { return (a.peer.joinedAt || 0) - (b.peer.joinedAt || 0); });
+			const next = others[0];
+			next.peer.owner = true;
+			try { next.ws.serializeAttachment(next.peer); } catch (_) { }
+			room.ownerId = next.peer.id;
+			await this.ctx.storage.put("room", room);
+			this.broadcast(encodeWire("PLAYER_LEFT", [peer.id]), ws);
+			this.broadcast(encodeWire("OWNER", [next.peer.id]), ws);
+			await this.updateDirectory(room);
 			return;
 		}
-
 		this.broadcast(encodeWire("PLAYER_LEFT", [peer.id]), ws);
-		if (room) {
-			await this.disableDirectMode(peer.roomId);
-			await this.updateDirectory(room);
-		}
-	}
-
-	async disableDirectMode(roomId) {
-		const room = await this.ctx.storage.get("room");
-		if (!room || room.id !== roomId) return;
-		room.directMode = false;
-		for (const socket of this.ctx.getWebSockets()) {
-			const state = socket.deserializeAttachment() || {};
-			if (state.joined) {
-				state.p2pReady = false;
-				socket.serializeAttachment(state);
-			}
-		}
-		await this.ctx.storage.put("room", room);
-		this.broadcastJoined(encodeWire("DIRECT_MODE", ["0"]), null);
+		if (room) await this.updateDirectory(room);
 	}
 
 	async moderate(owner, command, targetId) {
@@ -313,28 +242,12 @@ export class Room {
 		for (const ws of this.ctx.getWebSockets()) {
 			if (ws === target) continue;
 			const peer = ws.deserializeAttachment() || {};
-			if (!peer.joined || !peer.lastMove) continue;
-			const truck = [peer.id, peer.nickname].concat(peer.lastMove, [peer.owner ? "1" : "0"]);
-			if (truck.length > 11 && peer.lastState) truck[11] = peer.lastState;
-			try { target.send(encodeWire("TRUCK", truck)); } catch (_) { }
-		}
-	}
-
-	sendPeerEndpoints(target) {
-		for (const ws of this.ctx.getWebSockets()) {
-			if (ws === target) continue;
-			const peer = ws.deserializeAttachment() || {};
-			if (!peer.joined || !peer.endpointIp || !peer.endpointPort) continue;
-			try { target.send(encodeWire("ENDPOINT", [peer.id, peer.nickname, peer.endpointIp, peer.endpointPort, peer.token])); } catch (_) { }
-		}
-	}
-
-	broadcastJoined(line, excluded) {
-		for (const ws of this.ctx.getWebSockets()) {
-			if (ws === excluded) continue;
-			const peer = ws.deserializeAttachment() || {};
 			if (!peer.joined) continue;
-			try { ws.send(line); } catch (_) { }
+			const entry = this.moves.get(peer.id);
+			if (!entry) continue;
+			const fields = entry.fields.slice();
+			if (fields.length > 9 && entry.state) fields[9] = entry.state;
+			try { target.send(this.truckLine(peer, fields)); } catch (_) { }
 		}
 	}
 
@@ -352,7 +265,9 @@ export class Room {
 	async updateDirectory(meta, removeId) {
 		const directory = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
 		const body = meta ? JSON.stringify({ id: meta.id, name: meta.name, capacity: meta.capacity, count: this.ctx.getWebSockets().filter(function (ws) { const peer = ws.deserializeAttachment() || {}; return peer.joined; }).length, visibility: meta.visibility }) : JSON.stringify({ id: removeId });
-		await directory.fetch(meta ? "https://directory/upsert" : "https://directory/remove", { method: "POST", body: body });
+		try {
+			await directory.fetch(meta ? "https://directory/upsert" : "https://directory/remove", { method: "POST", body: body });
+		} catch (_) { }
 	}
 }
 
@@ -416,14 +331,4 @@ function randomId() {
 	const bytes = new Uint8Array(16);
 	crypto.getRandomValues(bytes);
 	return Array.from(bytes).map(function (value) { return value.toString(16).padStart(2, "0"); }).join("").toUpperCase();
-}
-
-function isValidIPv4(value) {
-	if (typeof value !== "string" || !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(value)) return false;
-	const octets = value.split(".");
-	for (let i = 0; i < octets.length; i++) {
-		const octet = Number(octets[i]);
-		if (!Number.isInteger(octet) || octet < 0 || octet > 255) return false;
-	}
-	return true;
 }
